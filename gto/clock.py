@@ -20,8 +20,8 @@ import os
 import sys
 import time
 
-TARGET = float(os.environ.get("GTO_TIME_TARGET", "5.0"))   # charged seconds per half we aim for
-PANIC = 6.5                  # beyond this: cheapest estimates, skip optional work
+TARGET = float(os.environ.get("GTO_TIME_TARGET", "4.0"))   # charged seconds per half we aim for
+PANIC = 5.5                  # beyond this: cheapest estimates, skip optional work
 EXTRA_PER_CALL = 0.0005      # s per request the judge sees that is not our CPU time
 EST_PER_HAND = 2.2           # hand-strength estimates per hand (one per street reached)
 PRIOR_OVERHEAD_MS = 2.5      # non-estimate cost per hand, before we have measured it

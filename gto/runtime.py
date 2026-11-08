@@ -268,7 +268,7 @@ class Brain:
         self.mode_hands[used] += 1
         nets = self.mode_nets[used]
         nets.append(result.my_net)
-        if used != "eq" and len(nets) >= STOP_MIN_HANDS:
+        if used != "eq" and len(nets) >= STOP_MIN_HANDS and len(nets) % 10 == 0:
             recent = np.asarray(nets[-STOP_WINDOW:], dtype=np.float64)
             se = recent.std() / math.sqrt(len(recent))
             if recent.mean() + STOP_Z * se < 0:
@@ -288,25 +288,26 @@ class Brain:
         q = float(QMID[3, int(B.assign(EDGES, 3, eq))])
         agg = sum(1 for _, a in opp if a in (RHALF, RPOT)) / len(opp)
         self.sd.append((q, agg))
+        self._update_blind()                  # only changes when a showdown arrives
 
-    def _blind_ok(self) -> bool:
-        """True if the showdowns we have seen show aggression unrelated to strength."""
+    def _update_blind(self) -> None:
+        """Do the showdowns seen so far show aggression unrelated to strength?"""
         if len(self.sd) < SD_MIN:
-            return False
+            self.blind = False
+            return
         x = np.array(self.sd)
         if x[:, 1].std() < 1e-9 or x[:, 0].std() < 1e-9:
             corr = 0.0                        # e.g. always raises: no relation possible
         else:
             corr = float(np.corrcoef(x[:, 0], x[:, 1])[0, 1])
         self.blind = corr < (SD_OFF_CORR if self.blind else SD_MAX_CORR)
-        return self.blind
 
     def _allowed(self, m: str) -> bool:
         if m == "eq":
             return True
         if m in self.blacklist:
             return False
-        return m not in BLIND_MODELS or self._blind_ok()
+        return m not in BLIND_MODELS or self.blind
 
     def _lead(self, m: str) -> float:
         return self.ll[m] - self.ll["eq"]

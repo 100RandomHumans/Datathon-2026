@@ -1,0 +1,7 @@
+# offline training artifacts (regenerable, too big for GitHub)
+gto/offline/deals.npz
+gto/offline/buckets.npz
+gto/offline/parts/
+gto/offline/logs/
+gto/offline/numba_cache/
+__pycache__/

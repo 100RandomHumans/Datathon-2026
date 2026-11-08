@@ -58,6 +58,7 @@ gto_warmup()
 def new_half(config: AgentConfig, memory: dict) -> None:
     """Fresh opponent model every half (nothing carries over anyway)."""
     memory["brain"] = Brain()
+    memory["brain"].clock.num_hands = max(1, config.num_hands)
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
@@ -213,4 +214,4 @@ if __name__ == "__main__":
     # The tournament sets PORT as an environment variable, so each bot is compliant to our evaluation platform
     # Locally it defaults to 5008 for your own testing convenience
     port = int(os.environ.get("PORT", "5008"))
-    uvicorn.run(app, host="10.244.128.233", port=port, log_level="info", access_log=False)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=False)

@@ -5,9 +5,11 @@ exploitative "restricted Nash response" strategies.
     python -m gto.offline.train                 # all models
     ITERS=2000000 python -m gto.offline.train   # more iterations
 
-Abstraction: the exact public betting tree (gto/tree.py) x 15 equity
-buckets per street (equity vs a random hand, percentile-bucketed, finer at
-the top). Infoset = (betting node, own current-street bucket).
+Abstraction (v2): the exact public betting tree (gto/tree.py) x the card
+buckets of gto/buckets.py (20 preflop, 30 flop, 30 turn, 20 river; flop and
+turn split by equity AND draw potential). Infoset = (node, own bucket).
+The equilibrium is trained as several independent seeds whose average
+strategies are combined (the maximin set of a zero-sum game is convex).
 
 Models:
     eq        self-play equilibrium of the abstract game (the GTO core)
@@ -27,20 +29,19 @@ import time
 import numpy as np
 from numba import njit
 
+from gto import buckets as B
 from gto.tree import FOLDED, NONTERM, SHOWDOWN, Tree
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.path.dirname(HERE), "data")
 
-# Bucket boundaries as quantiles (finer near the top: nut-ness matters in PLO).
-QPOINTS = np.array([0.12, 0.24, 0.35, 0.45, 0.54, 0.62, 0.69, 0.75, 0.81,
-                    0.86, 0.90, 0.935, 0.96, 0.98])
-K = len(QPOINTS) + 1
-QMID = np.array([(a + b) / 2 for a, b in zip(np.r_[0, QPOINTS], np.r_[QPOINTS, 1])])
+KS = B.KS
 
 ARCHETYPES = ["station", "maniac", "nit", "random", "half", "pot", "honest"]
-P_LOCK = {"station": 0.7, "maniac": 0.7, "nit": 0.7, "random": 0.8,
-          "half": 0.8, "pot": 0.8, "honest": 0.6}
+# How much each counter-strategy assumes the opponent IS the archetype. Lower =
+# less exploitative but much harder to counter-exploit (v2.1: all 0.5; was 0.6-0.8).
+P_LOCK = {"station": 0.5, "maniac": 0.5, "nit": 0.5, "random": 0.5,
+          "half": 0.5, "pot": 0.5, "honest": 0.5}
 
 
 def flatten(tree: Tree):
@@ -68,7 +69,7 @@ def flatten(tree: Tree):
                 acts[i, j] = a
                 child[i, j] = c
             offset[i] = off
-            off += K * len(nd.actions)
+            off += KS[nd.street] * len(nd.actions)
     return dict(kind=kind, street=street, actor=actor, nact=nact, child=child, acts=acts,
                 c0=c0, c1=c1, folder=folder, pot=pot, tocall=tocall, offset=offset), off
 
@@ -199,7 +200,7 @@ def traverse(n, p, d, tabs, arch, R, S, kind, street, actor, nact, child, acts, 
     sigma = np.empty(4)
     tab = tabs[a_]
     if tab == 2:
-        arch_policy(arch, qmid[b], tocall[n] > 0, na == (4 if tocall[n] > 0 else 3),
+        arch_policy(arch, qmid[st, b], tocall[n] > 0, na == (4 if tocall[n] > 0 else 3),
                     pot[n], tocall[n], st, sigma)
     else:
         regret_strategy(R, tab, idx, na, sigma)
@@ -268,7 +269,7 @@ def simulate(games, seed, hero_strat, vill_strat, varch, kind, street, actor, na
             na = nact[n]
             idx = offset[n] + b * na
             if a_ != h and varch >= 0:
-                arch_policy(varch, qmid[b], tocall[n] > 0, na == (4 if tocall[n] > 0 else 3),
+                arch_policy(varch, qmid[st, b], tocall[n] > 0, na == (4 if tocall[n] > 0 else 3),
                             pot[n], tocall[n], st, sigma)
             else:
                 src = hero_strat if a_ == h else vill_strat
@@ -293,6 +294,7 @@ def normalize(S, flat, size):
     nact, offset, kind = flat["nact"], flat["offset"], flat["kind"]
     for n in np.flatnonzero(kind == NONTERM):
         na = int(nact[n])
+        K = int(KS[flat["street"][n]])
         blk = S[offset[n]:offset[n] + K * na].reshape(K, na)
         tot = blk.sum(axis=1, keepdims=True)
         p = np.where(tot > 0, blk / np.maximum(tot, 1e-12), 1.0 / na)
@@ -312,16 +314,19 @@ def load_buckets():
         idx = (_COMB[holes[..., 0], 1] + _COMB[holes[..., 1], 2] + _COMB[holes[..., 2], 3]
                + _COMB[holes[..., 3], 4] + _COMB[holes[..., 4], 5])
         del holes
-        eq = np.concatenate([pf[idx][..., None], deals["eq"]], axis=2)  # (D, 2, 4)
-        edges = np.stack([np.quantile(eq[:, :, s].ravel(), QPOINTS) for s in range(4)])
-        bucket = np.stack([np.searchsorted(edges[s], eq[:, :, s], side="right") for s in range(4)],
-                          axis=2).astype(np.int8)
-        np.savez(cache, bucket=bucket, res=deals["res"], edges=edges)
+        pfe = pf[idx].astype(np.float64)                 # (D, 2)
+        feat = deals["feat"].astype(np.float64)           # (D, 2, 5)
+        edges, qmid = B.fit(pfe.ravel(), feat.reshape(-1, 5))
+        bucket = np.stack([B.assign(edges, 0, pfe),
+                           B.assign(edges, 1, feat[..., 0], feat[..., 1]),
+                           B.assign(edges, 2, feat[..., 2], feat[..., 3]),
+                           B.assign(edges, 3, feat[..., 4])], axis=2).astype(np.int8)
+        np.savez(cache, bucket=bucket, res=deals["res"], qmid=qmid, **B.pack(edges))
     c = np.load(cache)
-    return c["bucket"], c["res"].astype(np.float64), c["edges"]
+    return c["bucket"], c["res"].astype(np.float64), B.unpack(c), c["qmid"]
 
 
-def train(mode, arch, plock, iters, flat, size, bucket, res, seed):
+def train(mode, arch, plock, iters, flat, size, bucket, res, seed, qmid):
     R = np.zeros((2, size))
     S = np.zeros((2, size))
     chunk = max(1, iters // 40)
@@ -332,7 +337,7 @@ def train(mode, arch, plock, iters, flat, size, bucket, res, seed):
     k = 0
     while done < iters:
         m = min(chunk, iters - done)
-        run_chunk(m, seed + k, mode, arch, plock, R, S, *args, bucket, res, QMID)
+        run_chunk(m, seed * 1000 + k, mode, arch, plock, R, S, *args, bucket, res, qmid)
         done += m
         k += 1
         R *= k / (k + 1.0)  # linear CFR discounting
@@ -344,30 +349,52 @@ def train(mode, arch, plock, iters, flat, size, bucket, res, seed):
 PARTS = os.path.join(HERE, "parts")
 
 
+EQ_SEEDS = int(os.environ.get("EQ_SEEDS", "6"))
+
+
 def main():
-    """python -m gto.offline.train <model>   trains one model into offline/parts/
-    python -m gto.offline.train merge     builds gto/data/strategy.npz"""
+    """python -m gto.offline.train eq<k>|<arch>   trains one model into offline/parts/
+    python -m gto.offline.train merge          builds gto/data/strategy.npz"""
     tree = Tree()
     flat, size = flatten(tree)
-    bucket, res, edges = load_buckets()
+    bucket, res, edges, qmid = load_buckets()
     iters = int(os.environ.get("ITERS", "3000000"))
     os.makedirs(PARTS, exist_ok=True)
     name = sys.argv[1]
     if name != "merge":
-        if name == "eq":
-            R, S = train(0, 0, 0.0, iters, flat, size, bucket, res, 1)
+        if name.startswith("eq"):
+            R, S = train(0, 0, 0.0, iters, flat, size, bucket, res, 1 + int(name[2:] or 0), qmid)
         else:
             ai = ARCHETYPES.index(name)
-            R, S = train(1, ai, P_LOCK[name], iters, flat, size, bucket, res, 100 + ai)
+            R, S = train(1, ai, P_LOCK[name], iters, flat, size, bucket, res, 100 + ai, qmid)
         st, vis = normalize(S[0], flat, size)
-        np.savez(os.path.join(PARTS, f"{name}.npz"), strat=st, visits=vis)
+        np.savez(os.path.join(PARTS, f"{name}.npz"), strat=st.astype(np.float32),
+                 visits=vis.astype(np.float32))
         print("trained", name)
         return
     args = [flat[k] for k in ("kind", "street", "actor", "nact", "child", "acts", "c0", "c1",
                               "folder", "pot", "tocall", "offset")]
     out_path = os.path.join(DATA, "strategy.npz")
-    store = {"edges": edges, "qmid": QMID, "models": np.array(["eq"] + ARCHETYPES)}
-    for nm in ["eq"] + ARCHETYPES:
+    store = {"qmid": qmid, "models": np.array(["eq"] + ARCHETYPES), **B.pack(edges)}
+    # equilibrium: visit-weighted average of the independent seeds
+    num = np.zeros(size)
+    den = np.zeros(size)
+    for k in range(EQ_SEEDS):
+        part = np.load(os.path.join(PARTS, f"eq{k}.npz"))
+        num += part["strat"] * part["visits"]
+        den += part["visits"]
+    eq = np.where(den > 0, num / np.maximum(den, 1e-12), 0.0)
+    # unvisited infosets: uniform (normalize per node block)
+    for n in np.flatnonzero(flat["kind"] == NONTERM):
+        na = int(flat["nact"][n])
+        K = int(KS[flat["street"][n]])
+        o = flat["offset"][n]
+        blk = eq[o:o + K * na].reshape(K, na)
+        tot = blk.sum(axis=1, keepdims=True)
+        eq[o:o + K * na] = np.where(tot > 0, blk / np.maximum(tot, 1e-12), 1.0 / na).ravel()
+    store["strat_eq"] = eq.astype(np.float16)
+    store["visits_eq"] = np.minimum(den, 60000).astype(np.float16)
+    for nm in ARCHETYPES:
         part = np.load(os.path.join(PARTS, f"{nm}.npz"))
         store[f"strat_{nm}"] = part["strat"].astype(np.float16)
         store[f"visits_{nm}"] = np.minimum(part["visits"], 60000).astype(np.float16)
@@ -377,13 +404,13 @@ def main():
     for mi, name in enumerate(["eq"] + ARCHETYPES):
         counts = np.zeros((nnodes, 4))
         varch = -1 if name == "eq" else mi - 1
-        ev_eq = simulate(400000, 7, eq, eq, varch, *args, bucket, res, QMID, counts)
+        ev_eq = simulate(400000, 7, eq, eq, varch, *args, bucket, res, qmid, counts)
         store[f"marg_{name}"] = counts.astype(np.float32)
         line = f"  vs {name:8s}: eq-core {ev_eq / 2:+.3f} bb/hand"
         if name != "eq":
             ex = store[f"strat_{name}"].astype(np.float64)
-            ev_ex = simulate(400000, 7, ex, eq, varch, *args, bucket, res, QMID, np.zeros((nnodes, 4)))
-            ev_ex_vs_eq = simulate(400000, 7, ex, eq, -1, *args, bucket, res, QMID, np.zeros((nnodes, 4)))
+            ev_ex = simulate(400000, 7, ex, eq, varch, *args, bucket, res, qmid, np.zeros((nnodes, 4)))
+            ev_ex_vs_eq = simulate(400000, 7, ex, eq, -1, *args, bucket, res, qmid, np.zeros((nnodes, 4)))
             line += f" | exploit {ev_ex / 2:+.3f} bb/hand | exploit vs eq {ev_ex_vs_eq / 2:+.3f}"
         print(line)
     np.savez_compressed(out_path, **store)

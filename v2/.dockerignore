@@ -1,5 +1,0 @@
-# Offline training code and data are not needed while playing.
-gto/offline/
-**/__pycache__/
-.git/
-*.json

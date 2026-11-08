@@ -25,15 +25,16 @@ import time
 import numpy as np
 
 from gto import fasteval as fe
+from gto.clock import Clock, pick_level
 from gto.tree import FOLD, CALL, RHALF, RPOT, NONTERM, Tree
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 
 # ---- tuning knobs ----------------------------------------------------------
-MC_SAMPLES = 192            # postflop equity samples (about 0.8 ms)
-TIME_SOFT = 5.5             # seconds used: drop to cheaper equity estimates
-TIME_HARD = 7.0             # seconds used: minimal estimates
+# Time bank: see gto/clock.py. Postflop equity sample ladder (cheap -> precise);
+# the clock picks the largest count whose measured cost fits its allowance.
+LADDER = [32, 64, 96, 128, 192, 256]
 MIN_OPP_ACTIONS = 50        # observations before we may switch model
 SWITCH_MARGIN = 10.0        # log-likelihood lead (nats) over eq needed to switch
 STAY_MARGIN = 4.0           # hysteresis: lead needed to keep exploiting
@@ -121,6 +122,8 @@ class Brain:
     def __init__(self):
         self.rng = random.Random()
         self.time_used = 0.0
+        self.clock = Clock(1000)
+        self.cost = [0.2, 0.35, 0.45, 0.6, 0.85, 1.1]   # ms per level, refined by measurement
         self.cache_key = None
         self.cache_bucket = 0
         self.hand_log = {}          # hand_index -> (history codes, my seat, my last action)
@@ -131,11 +134,13 @@ class Brain:
 
     # -- decisions ------------------------------------------------------------
     def act(self, obs) -> int:
+        self.clock.begin()
         t0 = time.perf_counter()
         try:
             return self._act(obs)
         finally:
             self.time_used += time.perf_counter() - t0
+            self.clock.end()
 
     def _act(self, obs) -> int:
         legal = [int(a) for a in obs.legal_actions]
@@ -150,8 +155,13 @@ class Brain:
 
         key = (obs.hand_index, street)
         if key != self.cache_key:
-            samples = MC_SAMPLES if self.time_used < TIME_SOFT else (64 if self.time_used < TIME_HARD else 24)
-            eq = _hand_equity(list(obs.hole_cards), list(obs.board), samples)
+            level = pick_level(self.cost, self.clock.allowance_ms(obs.hand_index)) if obs.board else 0
+            t1 = time.perf_counter()
+            eq = _hand_equity(list(obs.hole_cards), list(obs.board), LADDER[level])
+            if obs.board:
+                dt = time.perf_counter() - t1
+                self.clock.add_estimate(dt)
+                self.cost[level] = 0.8 * self.cost[level] + 0.2 * dt * 1000.0
             self.cache_key, self.cache_bucket = key, _bucket(street, eq)
         b = self.cache_bucket
 
@@ -187,7 +197,9 @@ class Brain:
         try:
             self._hand_end(result)
         finally:
-            self.time_used += time.perf_counter() - t0
+            dt = time.perf_counter() - t0
+            self.time_used += dt
+            self.clock.add_wall(dt)
 
     def _opp_actions(self, result):
         """(node id, action code) for every opponent decision in the hand."""
@@ -215,6 +227,9 @@ class Brain:
         return out
 
     def _hand_end(self, result) -> None:
+        if self.clock.panic():
+            self.hand_log.pop(result.hand_index, None)
+            return  # out of time: opponent modelling is optional
         for n, a in self._opp_actions(result):
             self.n_obs += 1
             for m in MODELS:
